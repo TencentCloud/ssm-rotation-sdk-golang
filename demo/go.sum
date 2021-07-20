@@ -1,5 +1,7 @@
 github.com/go-sql-driver/mysql v1.6.0 h1:BCTh4TKNUYmOmMUcQ3IipzF5prigylS7XXjEkfCHuOE=
 github.com/go-sql-driver/mysql v1.6.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+github.com/tencentcloud/ssm-rotation-sdk-golang/lib v0.0.0-20210720025103-6b1bd3058530 h1:zda/YkcWCPa3W7Ok3sNh71drQJeMlRrg4omd75oswfA=
+github.com/tencentcloud/ssm-rotation-sdk-golang/lib v0.0.0-20210720025103-6b1bd3058530/go.mod h1:i4N8L53ISR0BbSQ/M2h6PeMh8ZFIE505ElPVLxhZ1uc=
 github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.204 h1:SLNBeVc+kBsnLqgMyIa8uUd2SIdIJ6x2L4sVPZm2XN8=
 github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.204/go.mod h1:7sCQWVkxcsR38nffDW057DRGk8mUjK1Ing/EFOK8s8Y=
 github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssm v1.0.204 h1:0Zq7va2x9/ady34YEqyONzXzQQf/zx1nTCFfAUmXMlE=
