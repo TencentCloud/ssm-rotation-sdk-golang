@@ -1,0 +1,6 @@
+github.com/go-sql-driver/mysql v1.6.0 h1:BCTh4TKNUYmOmMUcQ3IipzF5prigylS7XXjEkfCHuOE=
+github.com/go-sql-driver/mysql v1.6.0/go.mod h1:DCzpHaOWr8IXmIStZouvnhqoel9Qv2LBy8hT2VhHyBg=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.204 h1:SLNBeVc+kBsnLqgMyIa8uUd2SIdIJ6x2L4sVPZm2XN8=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.0.204/go.mod h1:7sCQWVkxcsR38nffDW057DRGk8mUjK1Ing/EFOK8s8Y=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssm v1.0.204 h1:0Zq7va2x9/ady34YEqyONzXzQQf/zx1nTCFfAUmXMlE=
+github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssm v1.0.204/go.mod h1:a5yWxx1yem1PXNFV+JRdJnqdVxZeQ8mMrCTs3ZjwOto=
