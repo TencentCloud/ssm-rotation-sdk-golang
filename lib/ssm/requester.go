@@ -21,8 +21,6 @@ func GetCurrentAccount(secretName string, ssmAcc *SsmAccount) (*DbAccount, error
 		log.Println("failed to GetCurrentProductSecretValue, err= ", err)
 		return nil, err
 	}
-	// secretValue 是 JSON格式的字符串，形如： {"UserName":"test_user","Password":"test_pwd"}
-	log.Println("secret value: ", secretValue)
 	if len(secretValue) == 0 {
 		return nil, fmt.Errorf("no valid account info found because secret value is empty")
 	}
