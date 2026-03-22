@@ -30,14 +30,15 @@ var dbConn *db.DynamicSecretRotationDb
 func main() {
 	// ==================== 选择认证方式（三选一）====================
 
-	// 方式一：固定 AK/SK（向后兼容，不推荐在生产环境使用）
-	ssmAccount := ssm.WithPermanentCredential(
-		"SecretId",     // 需填写实际可用的 SecretId
-		"SecretKey",    // 需填写实际可用的 SecretKey
-		"ap-guangzhou", // 选择凭据所存储的地域
+	// 方式一：CVM 角色绑定（推荐，仅限 CVM 环境）
+	// SDK 通过元数据服务自动获取和刷新临时凭据，安全性最高
+	ssmAccount := ssm.WithCamRole(
+		"your-cam-role-name", // CVM 实例绑定的 CAM 角色名称
+		"ap-guangzhou",       // 选择凭据所存储的地域
 	)
 
 	// 方式二：临时凭据
+	// 注意：临时凭据有过期时间，SDK 不会自动刷新此方式的凭据
 	// ssmAccount := ssm.WithTemporaryCredential(
 	// 	"TmpSecretId",  // 临时 SecretId
 	// 	"TmpSecretKey", // 临时 SecretKey
@@ -45,13 +46,14 @@ func main() {
 	// 	"ap-guangzhou", // 选择凭据所存储的地域
 	// )
 
-	// 方式三：CVM 角色绑定（推荐，仅限 CVM 环境）
-	// ssmAccount := ssm.WithCamRole(
-	// 	"your-cam-role-name", // CVM 实例绑定的 CAM 角色名称
-	// 	"ap-guangzhou",       // 选择凭据所存储的地域
+	// 方式三：固定 AK/SK（向后兼容，不推荐在生产环境使用）
+	// ssmAccount := ssm.WithPermanentCredential(
+	// 	"SecretId",     // 需填写实际可用的 SecretId
+	// 	"SecretKey",    // 需填写实际可用的 SecretKey
+	// 	"ap-guangzhou", // 选择凭据所存储的地域
 	// )
 
-	// 旧写法仍然兼容（等同于方式一）：
+	// 旧写法仍然兼容（等同于方式三）：
 	// ssmAccount := &ssm.SsmAccount{
 	// 	SecretId:  "SecretId",
 	// 	SecretKey: "SecretKey",
@@ -75,6 +77,7 @@ func main() {
 		},
 		SsmServiceConfig:    ssmAccount,
 		WatchChangeInterval: time.Second * 10, // 多长时间检查一下凭据是否发生了轮转（范围 1-60 秒）
+		RotationGracePeriod: time.Second * 30, // 可选：轮转后旧连接的延迟退休时间，降低并发请求被切断的风险
 	})
 	if err != nil {
 		log.Fatal("failed to init dbConn, err=", err)
@@ -91,6 +94,9 @@ func main() {
 	result := dbConn.GetHealthCheckResult()
 	log.Printf("healthCheck: healthy=%v, currentUser=%s, watchFailures=%d",
 		result.Healthy, result.CurrentUser, result.WatchFailures)
+
+	// 获取当前凭据用户名（可用于监控轮转是否生效）
+	log.Printf("currentUser: %s", dbConn.GetCurrentUser())
 
 	// 模拟业务处理中，每过一段时间（一般是几毫秒），需要拿到db连接，来操作数据库的场景
 	t := time.Tick(time.Second)
