@@ -31,3 +31,6 @@ vendor/
 # Build output
 build/
 dist/
+
+# Go compiled binary (no extension on macOS/Linux)
+demo/demo

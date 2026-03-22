@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2025 Tencent. All Rights Reserved.
+ * Copyright (c) 2017-2026 Tencent. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -28,11 +29,15 @@ import (
 	"time"
 
 	"github.com/tencentcloud/ssm-rotation-sdk-golang/lib/ssm"
+	ssmapi "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssm/v20190923"
 )
 
 const (
 	defaultRotationGracePeriod = 30 * time.Second
 	maxWatchFailures           = 5
+	defaultPingTimeout         = 5 * time.Second
+	// maxBackoffMultiplier 指数退避最大倍数（2^5 = 32 倍）
+	maxBackoffMultiplier = 5
 )
 
 // DynamicSecretRotationDb 动态凭据轮转数据库连接管理器
@@ -45,24 +50,29 @@ const (
 // 注意：Go 的 database/sql 自带连接池管理，每次调用 GetConn() 获取的是连接池对象。
 // 请勿在业务代码中缓存 GetConn() 返回的 *sql.DB，以确保凭据轮转后能及时使用新连接。
 type DynamicSecretRotationDb struct {
-	config    *Config
-	dbConn    atomic.Value
-	stopCh    chan struct{}
-	closeOnce sync.Once
-	closed    int32
-	retiredMu sync.Mutex
-	retired   []retiredConn
+	config      *Config
+	dbConn      atomic.Value
+	stopCh      chan struct{}
+	watcherDone chan struct{} // watcher goroutine 退出信号
+	closeOnce   sync.Once
+	initOnce    sync.Once
+	closed      int32
+	retiredMu   sync.Mutex
+	retired     []retiredConn
+
+	// 缓存的 SSM 客户端，避免每次轮询都重新创建 TCP/TLS 连接
+	cachedSsmClient *ssmapi.Client
 
 	// 健康状态
 	watchFailures int32
 	lastError     atomic.Value // 存储 string 类型
 }
 
-// ConnCache 连接缓存，存储当前活跃的数据库连接及其凭据信息
-type ConnCache struct {
-	UserName string
-	Password string
-	Conn     *sql.DB
+// connCache 连接缓存，存储当前活跃的数据库连接及其凭据信息
+type connCache struct {
+	userName string
+	password string
+	conn     *sql.DB
 }
 
 type connInfo struct {
@@ -178,15 +188,19 @@ func (c *Config) validate() error {
 	return nil
 }
 
-func (c *Config) buildConnInfo() (*connInfo, error) {
-	account, err := ssm.GetCurrentAccount(c.DbConfig.SecretName, c.SsmServiceConfig)
+func (c *Config) buildConnInfo(client *ssmapi.Client) (*connInfo, error) {
+	account, err := ssm.GetCurrentAccountWithClient(c.DbConfig.SecretName, client)
 	if err != nil {
 		return nil, err
 	}
 
+	// 对用户名和密码进行转义，防止特殊字符破坏 DSN 格式
+	escapedUser := url.PathEscape(account.UserName)
+	escapedPass := url.PathEscape(account.Password)
+
 	connStr := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
-		account.UserName,
-		account.Password,
+		escapedUser,
+		escapedPass,
 		c.DbConfig.IpAddress,
 		c.DbConfig.Port,
 		c.DbConfig.DbName,
@@ -230,23 +244,48 @@ func buildParamString(dbConfig *DbConfig) string {
 // Init 初始化数据库连接管理器
 //
 // 根据提供的配置信息，获取数据库凭据并建立连接，然后启动后台凭据监控。
-// 在服务初始化时调用本方法。
+// 在服务初始化时调用本方法。注意：不可重复调用。
 func (d *DynamicSecretRotationDb) Init(config *Config) error {
-	if err := config.validate(); err != nil {
-		return err
-	}
-	d.config = config
-	d.stopCh = make(chan struct{})
+	var initErr error
+	d.initOnce.Do(func() {
+		if err := config.validate(); err != nil {
+			initErr = err
+			return
+		}
+		d.config = config
+		d.stopCh = make(chan struct{})
+		d.watcherDone = make(chan struct{})
 
-	info, err := d.config.buildConnInfo()
-	if err != nil {
-		return err
+		// 创建并缓存 SSM 客户端，后续 watcher 轮询复用
+		client, err := ssm.CreateSsmClient(config.SsmServiceConfig)
+		if err != nil {
+			initErr = fmt.Errorf("create ssm client error: %s", err)
+			return
+		}
+		d.cachedSsmClient = client
+
+		info, err := d.config.buildConnInfo(d.cachedSsmClient)
+		if err != nil {
+			initErr = err
+			return
+		}
+		if err := d.initDbConn(info); err != nil {
+			initErr = err
+			return
+		}
+		log.Printf("succeed to init dbConn for user=%s", info.account.UserName)
+
+		// 临时凭据模式提示：SDK 不会自动刷新临时凭据
+		if config.SsmServiceConfig.CredentialType == ssm.Temporary {
+			log.Println("[WARN] Using TEMPORARY credential type. The SDK will NOT auto-refresh the temporary credential. " +
+				"Please ensure the token remains valid during the SDK's lifecycle, or consider using CamRole credential type.")
+		}
+
+		go d.watchSecretChange()
+	})
+	if initErr != nil {
+		return initErr
 	}
-	if err := d.initDbConn(info); err != nil {
-		return err
-	}
-	log.Printf("succeed to init dbConn for user=%s", info.account.UserName)
-	go d.watchSecretChange()
 	return nil
 }
 
@@ -259,14 +298,14 @@ func (d *DynamicSecretRotationDb) GetConn() *sql.DB {
 		return nil
 	}
 	if conn := d.currentConnCache(); conn != nil {
-		return conn.Conn
+		return conn.conn
 	}
 	return nil
 }
 
 // Close 关闭连接管理器
 //
-// 停止后台 watcher，关闭当前数据库句柄和所有退休句柄。
+// 停止后台 watcher，等待其退出后关闭当前数据库句柄和所有退休句柄。
 // 建议在应用退出时调用。
 func (d *DynamicSecretRotationDb) Close() error {
 	var closeErr error
@@ -275,9 +314,13 @@ func (d *DynamicSecretRotationDb) Close() error {
 		if d.stopCh != nil {
 			close(d.stopCh)
 		}
+		// 等待 watcher goroutine 完全退出，避免与 cleanupRetired 竞争
+		if d.watcherDone != nil {
+			<-d.watcherDone
+		}
 		d.cleanupRetired(true)
-		if cache := d.currentConnCache(); cache != nil && cache.Conn != nil {
-			closeErr = cache.Conn.Close()
+		if cache := d.currentConnCache(); cache != nil && cache.conn != nil {
+			closeErr = cache.conn.Close()
 		}
 	})
 	return closeErr
@@ -295,7 +338,7 @@ func (d *DynamicSecretRotationDb) IsHealthy() bool {
 func (d *DynamicSecretRotationDb) GetHealthCheckResult() *HealthCheckResult {
 	currentUser := ""
 	if cache := d.currentConnCache(); cache != nil {
-		currentUser = cache.UserName
+		currentUser = cache.userName
 	}
 
 	lastErr := ""
@@ -315,13 +358,13 @@ func (d *DynamicSecretRotationDb) GetHealthCheckResult() *HealthCheckResult {
 // GetCurrentUser 获取当前凭据用户名（用于监控轮转）
 func (d *DynamicSecretRotationDb) GetCurrentUser() string {
 	if cache := d.currentConnCache(); cache != nil {
-		return cache.UserName
+		return cache.userName
 	}
 	return ""
 }
 
-func (d *DynamicSecretRotationDb) currentConnCache() *ConnCache {
-	if cache, ok := d.dbConn.Load().(*ConnCache); ok {
+func (d *DynamicSecretRotationDb) currentConnCache() *connCache {
+	if cache, ok := d.dbConn.Load().(*connCache); ok {
 		return cache
 	}
 	return nil
@@ -342,24 +385,30 @@ func (d *DynamicSecretRotationDb) initDbConn(info *connInfo) error {
 	connLifeTime := time.Duration(dbConfig.IdleTimeoutSeconds) * time.Second
 	tmpDbConn.SetConnMaxLifetime(connLifeTime)
 
-	err = tmpDbConn.Ping()
+	// 使用带超时的 Ping，防止数据库不可达时长时间阻塞
+	ctx, cancel := context.WithTimeout(context.Background(), defaultPingTimeout)
+	defer cancel()
+	err = tmpDbConn.PingContext(ctx)
 	if err != nil {
+		_ = tmpDbConn.Close()
 		return fmt.Errorf("ping cdb error: %s", err)
 	}
 
 	curConn := d.currentConnCache()
-	d.dbConn.Store(&ConnCache{
-		UserName: info.userName,
-		Password: info.password,
-		Conn:     tmpDbConn,
+	d.dbConn.Store(&connCache{
+		userName: info.userName,
+		password: info.password,
+		conn:     tmpDbConn,
 	})
-	if curConn != nil && curConn.Conn != nil {
-		d.retireConn(curConn.Conn)
+	if curConn != nil && curConn.conn != nil {
+		d.retireConn(curConn.conn)
 	}
 	return nil
 }
 
 func (d *DynamicSecretRotationDb) watchSecretChange() {
+	defer close(d.watcherDone) // 通知 Close() 方法 watcher 已完全退出
+
 	initialDelay := d.randomizedInitialDelay()
 	if initialDelay > 0 {
 		timer := time.NewTimer(initialDelay)
@@ -372,7 +421,8 @@ func (d *DynamicSecretRotationDb) watchSecretChange() {
 		}
 	}
 
-	ticker := time.NewTicker(d.config.WatchChangeInterval)
+	interval := d.config.WatchChangeInterval
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -380,6 +430,20 @@ func (d *DynamicSecretRotationDb) watchSecretChange() {
 		case <-ticker.C:
 			d.cleanupRetired(false)
 			d.watchChange()
+
+			// 指数退避：连续失败超过阈值后，逐步增大轮询间隔
+			failures := atomic.LoadInt32(&d.watchFailures)
+			if failures >= maxWatchFailures {
+				exponent := failures - maxWatchFailures
+				if exponent > maxBackoffMultiplier {
+					exponent = maxBackoffMultiplier
+				}
+				backoff := interval * time.Duration(int64(1)<<uint(exponent))
+				ticker.Reset(backoff)
+			} else if failures == 0 {
+				// 恢复正常后，重置为原始间隔
+				ticker.Reset(interval)
+			}
 		case <-d.stopCh:
 			return
 		}
@@ -391,7 +455,7 @@ func (d *DynamicSecretRotationDb) watchChange() {
 		return
 	}
 
-	info, err := d.config.buildConnInfo()
+	info, err := d.config.buildConnInfo(d.cachedSsmClient)
 	if err != nil {
 		failures := atomic.AddInt32(&d.watchFailures, 1)
 		d.lastError.Store(err.Error())
@@ -415,7 +479,7 @@ func (d *DynamicSecretRotationDb) watchChange() {
 	}
 
 	if current != nil {
-		log.Printf("credential rotated: %s -> %s", current.UserName, info.account.UserName)
+		log.Printf("credential rotated: %s -> %s", current.userName, info.account.UserName)
 	} else {
 		log.Printf("credential initialized for user=%s", info.account.UserName)
 	}
@@ -428,16 +492,16 @@ func (d *DynamicSecretRotationDb) watchChange() {
 }
 
 // isCredentialChanged 检测凭据是否变化（用户名或密码任一变化）
-func isCredentialChanged(current *ConnCache, newInfo *connInfo) bool {
+func isCredentialChanged(current *connCache, newInfo *connInfo) bool {
 	if current == nil || newInfo == nil {
 		return true
 	}
 	// 用户名变化
-	if current.UserName != newInfo.userName {
+	if current.userName != newInfo.userName {
 		return true
 	}
 	// 密码变化（同一用户密码轮转场景）
-	if current.Password != newInfo.password {
+	if current.password != newInfo.password {
 		log.Printf("password rotated for user: %s", newInfo.userName)
 		return true
 	}
@@ -477,31 +541,32 @@ func (d *DynamicSecretRotationDb) retireConn(db *sql.DB) {
 }
 
 func (d *DynamicSecretRotationDb) cleanupRetired(force bool) {
+	var toClose []retiredConn
+
 	d.retiredMu.Lock()
-	retired := d.retired
 	if force {
+		toClose = d.retired
 		d.retired = nil
 	} else {
-		remaining := make([]retiredConn, 0, len(retired))
 		now := time.Now()
-		for _, item := range retired {
+		remaining := make([]retiredConn, 0, len(d.retired))
+		for _, item := range d.retired {
 			if item.db == nil {
 				continue
 			}
 			if now.Before(item.expireAt) {
 				remaining = append(remaining, item)
+			} else {
+				toClose = append(toClose, item)
 			}
 		}
 		d.retired = remaining
 	}
 	d.retiredMu.Unlock()
 
-	now := time.Now()
-	for _, item := range retired {
+	// 在锁外执行 Close，避免持锁时间过长
+	for _, item := range toClose {
 		if item.db == nil {
-			continue
-		}
-		if !force && now.Before(item.expireAt) {
 			continue
 		}
 		if err := item.db.Close(); err != nil {

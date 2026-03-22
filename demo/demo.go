@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2025 Tencent. All Rights Reserved.
+ * Copyright (c) 2017-2026 Tencent. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -110,7 +110,7 @@ func accessDb() {
 		return
 	}
 	if err := c.Ping(); err != nil {
-		log.Fatal("failed to access db with err: ", err)
+		log.Println("failed to access db with err: ", err)
 		return
 	}
 	log.Println("--- succeed to access db")

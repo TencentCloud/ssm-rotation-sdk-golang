@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2025 Tencent. All Rights Reserved.
+ * Copyright (c) 2017-2026 Tencent. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,23 @@ package ssm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	ssm "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/ssm/v20190923"
+)
+
+// sentinel errors，方便调用方通过 errors.Is 做分类处理
+var (
+	// ErrConfigInvalid 配置参数无效
+	ErrConfigInvalid = errors.New("ssm: config invalid")
+	// ErrSsmApi SSM API 调用失败
+	ErrSsmApi = errors.New("ssm: api error")
+	// ErrSecretFormat 凭据格式无效
+	ErrSecretFormat = errors.New("ssm: invalid secret format")
 )
 
 // CredentialType 凭据类型枚举
@@ -200,55 +210,72 @@ type DbAccount struct {
 	Password string `json:"Password"`
 }
 
+// CreateSsmClient 创建 SSM 客户端（公开方法，供外部缓存复用）
+func CreateSsmClient(ssmAcc *SsmAccount) (*ssm.Client, error) {
+	return createSsmClient(ssmAcc)
+}
+
 // GetCurrentAccount 获取当前数据库账号信息
+//
+// 注意：此方法每次调用都会创建新的 SSM Client。
+// 如果需要频繁调用（如周期性轮询），建议使用 CreateSsmClient 创建客户端后，
+// 通过 GetCurrentAccountWithClient 复用，以避免重复创建 TCP/TLS 连接的开销。
 func GetCurrentAccount(secretName string, ssmAcc *SsmAccount) (*DbAccount, error) {
-	secretValue, err := getCurrentProductSecretValue(secretName, ssmAcc)
+	client, err := createSsmClient(ssmAcc)
+	if err != nil {
+		return nil, fmt.Errorf("create ssm HTTP client error: %w", err)
+	}
+	return GetCurrentAccountWithClient(secretName, client)
+}
+
+// GetCurrentAccountWithClient 使用已有的 SSM 客户端获取当前数据库账号信息
+//
+// 推荐在需要频繁调用的场景（如 watcher 轮询）中复用 Client，
+// 以避免重复创建 TCP/TLS 连接的开销。
+func GetCurrentAccountWithClient(secretName string, client *ssm.Client) (*DbAccount, error) {
+	secretValue, err := getSecretValueWithClient(secretName, client)
 	if err != nil {
 		return nil, err
 	}
 	if len(secretValue) == 0 {
-		return nil, fmt.Errorf("secret value is empty")
+		return nil, fmt.Errorf("%w: secret value is empty", ErrSecretFormat)
 	}
 	account := &DbAccount{}
 	if err := json.Unmarshal([]byte(secretValue), account); err != nil {
-		log.Println("err when parse secretValue in json format, err= ", err)
-		return nil, fmt.Errorf("invalid secret value format")
+		return nil, fmt.Errorf("%w: invalid JSON format", ErrSecretFormat)
 	}
 	if account.UserName == "" || account.Password == "" {
-		return nil, fmt.Errorf("invalid secret format: missing userName or password")
+		return nil, fmt.Errorf("%w: missing userName or password", ErrSecretFormat)
 	}
 	return account, nil
 }
 
-func getCurrentProductSecretValue(secretName string, ssmAcc *SsmAccount) (string, error) {
-	log.Printf("get value for secretName=%v", secretName)
-	startTime := time.Now()
-	client, err := createSsmClient(ssmAcc)
-	if err != nil {
-		return "", fmt.Errorf("create ssm HTTP client error: %s", err)
+// getSecretValueWithClient 使用指定的 SSM 客户端获取凭据值
+func getSecretValueWithClient(secretName string, client *ssm.Client) (string, error) {
+	if client == nil {
+		return "", fmt.Errorf("%w: ssm client cannot be nil", ErrConfigInvalid)
 	}
 	request := ssm.NewGetSecretValueRequest()
 	request.SecretName = &secretName
 	request.VersionId = common.StringPtr("SSM_Current")
 	rsp, err := client.GetSecretValue(request)
 	if err != nil {
-		return "", fmt.Errorf("ssm GetSecretValue error: %s", err.Error())
+		return "", fmt.Errorf("%w: %s", ErrSsmApi, err.Error())
 	}
 	if rsp.Response.SecretString == nil {
 		log.Println("Secret Value is nil")
 		return "", nil
 	}
-	log.Printf("GetCurrentProductSecretValue cost time: %d ms", time.Since(startTime).Milliseconds())
 	return *rsp.Response.SecretString, nil
 }
 
 // createSsmClient 根据凭据类型创建 SSM 客户端
 func createSsmClient(ssmAcc *SsmAccount) (*ssm.Client, error) {
 	if ssmAcc == nil {
-		return nil, fmt.Errorf("ssm account cannot be nil")
+		return nil, fmt.Errorf("%w: ssm account cannot be nil", ErrConfigInvalid)
 	}
 	if ssmAcc.Region == "" {
-		return nil, fmt.Errorf("region is required")
+		return nil, fmt.Errorf("%w: region is required", ErrConfigInvalid)
 	}
 
 	credential, err := createCredential(ssmAcc)
@@ -267,21 +294,14 @@ func createSsmClient(ssmAcc *SsmAccount) (*ssm.Client, error) {
 }
 
 // createCredential 根据凭据类型创建对应的 Credential 对象
+//
+// 注意：调用前应先通过 SsmAccount.Validate() 校验参数，此处不再重复校验。
 func createCredential(ssmAcc *SsmAccount) (common.CredentialIface, error) {
 	switch ssmAcc.CredentialType {
 	case Temporary:
-		if ssmAcc.SecretId == "" || ssmAcc.SecretKey == "" {
-			return nil, fmt.Errorf("secretId and secretKey are required for TEMPORARY credential type")
-		}
-		if ssmAcc.Token == "" {
-			return nil, fmt.Errorf("token is required for TEMPORARY credential type")
-		}
 		return common.NewTokenCredential(ssmAcc.SecretId, ssmAcc.SecretKey, ssmAcc.Token), nil
 
 	case CamRole:
-		if ssmAcc.RoleName == "" {
-			return nil, fmt.Errorf("roleName is required for CAM_ROLE credential type")
-		}
 		provider := common.NewCvmRoleProvider(ssmAcc.RoleName)
 		return provider.GetCredential()
 
@@ -289,9 +309,6 @@ func createCredential(ssmAcc *SsmAccount) (common.CredentialIface, error) {
 		fallthrough
 	default:
 		// 默认使用固定 AK/SK（向后兼容）
-		if ssmAcc.SecretId == "" || ssmAcc.SecretKey == "" {
-			return nil, fmt.Errorf("secretId and secretKey are required for PERMANENT credential type")
-		}
 		return common.NewCredential(ssmAcc.SecretId, ssmAcc.SecretKey), nil
 	}
 }
