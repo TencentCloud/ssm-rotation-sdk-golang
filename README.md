@@ -81,9 +81,15 @@ err := dbConn.Init(&db.Config{
 if err != nil {
     log.Fatal(err)
 }
-defer dbConn.Close()
+defer func() {
+    if err := dbConn.Close(); err != nil {
+        log.Printf("close dbConn error: %v", err)
+    }
+}()
 
-// 3. 获取连接（请勿缓存，每次调用 GetConn()）
+// 3. 获取连接池对象（请勿缓存，每次调用 GetConn()）
+// GetConn() 返回的是 *sql.DB 连接池对象，而非单个连接；
+// database/sql 内部会自动管理连接的创建、复用和回收。
 c := dbConn.GetConn()
 if err := c.Ping(); err != nil {
     log.Fatal(err)
@@ -149,8 +155,8 @@ result := dbConn.GetHealthCheckResult()
 ## 注意事项
 
 - `Region` 必填
-- 每次访问数据库请调用 `GetConn()` 获取最新连接，请勿缓存
-- `Close()` 会停止后台 watcher，并关闭当前数据库句柄；建议在应用退出时调用
+- 每次访问数据库请调用 `GetConn()` 获取最新连接池对象（`*sql.DB`），请勿缓存；Go 的 `database/sql` 自带连接池，SDK 内部已配置好池参数
+- `Close()` 会依次：停止后台 watcher → 等待 watcher goroutine 退出 → 清理所有退休句柄 → 关闭当前数据库句柄；建议在应用退出时通过 `defer` 调用，并处理返回的错误
 - Watcher 启动时会自动增加随机初始延时，降低多实例同时访问 SSM 的请求尖峰
 - 轮转时旧 DB 句柄会按 `RotationGracePeriod` 延迟关闭，降低高并发下请求被切断的风险
 - 临时凭据有过期时间，SDK 不会自动刷新 `Temporary` 类型凭据
